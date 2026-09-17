@@ -848,7 +848,6 @@ pub fn is_solid(state: BlockState) -> bool {
 
 /// Vanilla cached `BlockState.canBeReplaced()` property. Context-sensitive
 /// overrides are handled by higher-level placement code when needed.
-#[allow(dead_code)]
 pub fn is_replaceable(state: BlockState) -> bool {
     block_data(state).replaceable
 }
@@ -862,6 +861,40 @@ pub fn is_full_face_sturdy(state: BlockState, direction: usize) -> bool {
 
 pub fn fluid(state: BlockState) -> Fluid {
     block_data(state).fluid
+}
+
+/// Vanilla `FluidState.createLegacyBlock` for the fluid contained by `state`.
+/// This matters for local block-break prediction: destroying a waterlogged
+/// block leaves a water block client-side instead of air until the server's
+/// prediction acknowledgement resolves the change.
+pub fn fluid_legacy_block_state(state: BlockState) -> BlockState {
+    let fluid = fluid(state);
+    let (name, level) = match fluid.kind {
+        FluidKind::Empty => return BlockState::AIR,
+        FluidKind::Water => (
+            "water",
+            if fluid.falling {
+                8
+            } else {
+                8_u8.saturating_sub(fluid.amount)
+            },
+        ),
+        FluidKind::Lava => (
+            "lava",
+            if fluid.falling {
+                8
+            } else {
+                8_u8.saturating_sub(fluid.amount)
+            },
+        ),
+    };
+    let level = level.to_string();
+    all_states()
+        .find(|(candidate, data)| {
+            data.id == name && block_properties(*candidate).get("level") == Some(level.as_str())
+        })
+        .map(|(candidate, _)| candidate)
+        .unwrap_or(BlockState::AIR)
 }
 
 pub(crate) fn block_shape(state: BlockState) -> Option<&'static [LocalBox]> {
@@ -1107,6 +1140,27 @@ mod tests {
         assert_eq!(fluid(logged).amount, 8);
 
         assert_eq!(fluid(BlockState::AIR).kind, FluidKind::Empty);
+    }
+
+    #[test]
+    fn fluid_legacy_block_state_matches_vanilla_break_replacement() {
+        setup();
+        let logged = find_state("oak_stairs", &[("waterlogged", "true")]);
+        let replacement = fluid_legacy_block_state(logged);
+        assert_eq!(block_id(replacement), "water");
+        assert_eq!(block_properties(replacement).get("level"), Some("0"));
+
+        let flowing = find_state("water", &[("level", "5")]);
+        let replacement = fluid_legacy_block_state(flowing);
+        assert_eq!(block_id(replacement), "water");
+        assert_eq!(block_properties(replacement).get("level"), Some("5"));
+
+        let falling = find_state("lava", &[("level", "12")]);
+        let replacement = fluid_legacy_block_state(falling);
+        assert_eq!(block_id(replacement), "lava");
+        assert_eq!(block_properties(replacement).get("level"), Some("8"));
+
+        assert_eq!(fluid_legacy_block_state(BlockState::AIR), BlockState::AIR);
     }
 
     #[test]

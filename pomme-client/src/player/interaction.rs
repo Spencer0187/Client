@@ -33,7 +33,9 @@ use crate::player::inventory::item_resource_name;
 use crate::renderer::pipelines::held_item::UseAnim;
 use crate::world::block::registry::BlockRegistry;
 use crate::world::block::sound::block_sounds;
-use crate::world::block::{has_collision, is_air};
+use crate::world::block::{
+    block_id, block_properties, fluid_legacy_block_state, has_collision, is_air, is_replaceable,
+};
 use crate::world::chunk::ChunkStore;
 
 const REACH: f32 = 4.5;
@@ -207,7 +209,7 @@ impl InteractionState {
         dirty_chunks: &mut Vec<BlockPos>,
     ) {
         self.retain_known_server_state(pos, state, player_pos);
-        chunks.set_block_state(pos.x, pos.y, pos.z, BlockState::AIR);
+        chunks.set_block_state(pos.x, pos.y, pos.z, fluid_legacy_block_state(state));
         mark_dirty(&pos, dirty_chunks);
         play_break_sound(audio, state, pos);
         effects.particles.add_destroy_block_effect(
@@ -355,6 +357,7 @@ impl InteractionState {
         food: u32,
         selected_slot: u8,
         held_stack: Option<&ItemStackData>,
+        held_block_item: bool,
         place_block: Option<BlockState>,
         hands_empty: bool,
         effects: &mut BreakEffects,
@@ -419,6 +422,7 @@ impl InteractionState {
                 player_aabb,
                 eye_pos,
                 look,
+                held_block_item,
                 place_block,
                 held_stack,
                 food,
@@ -658,6 +662,7 @@ impl InteractionState {
         player_aabb: Aabb,
         eye_pos: DVec3,
         look: LookDirection,
+        held_block_item: bool,
         place_block: Option<BlockState>,
         held_stack: Option<&ItemStackData>,
         food: u32,
@@ -713,16 +718,22 @@ impl InteractionState {
                     return true;
                 }
             }
-            if place_block.is_some() {
+            if held_block_item {
+                // A BlockItem consumes the block interaction even when Pomme
+                // cannot faithfully predict its resulting multi-state/contextual
+                // state. Keep those cases server-authoritative locally rather
+                // than falling through to an extra ServerboundUseItem packet.
                 self.swing(sender);
-                self.predict_place(
-                    hit,
-                    place_block,
-                    chunks,
-                    player_pos,
-                    player_aabb,
-                    dirty_chunks,
-                );
+                if place_block.is_some() {
+                    self.predict_place(
+                        hit,
+                        place_block,
+                        chunks,
+                        player_pos,
+                        player_aabb,
+                        dirty_chunks,
+                    );
+                }
                 return true;
             }
             true
@@ -993,19 +1004,16 @@ impl InteractionState {
         let Some(state) = place_block else {
             return;
         };
-        let pos = hit.block_pos.offset_with_direction(hit.face);
-
-        // Only predict into an empty cell; replacing grass/water isn't handled yet.
-        if !is_air(chunks.get_block_state(pos.x, pos.y, pos.z)) {
+        let Some((pos, previous_state)) = prediction_place_target(hit, state, chunks) else {
             return;
-        }
+        };
 
         // Don't predict a solid block overlapping the player; the server denies it.
         if has_collision(state) && Aabb::block(pos.x, pos.y, pos.z).intersects(&player_aabb) {
             return;
         }
 
-        self.retain_known_server_state(pos, BlockState::AIR, player_pos);
+        self.retain_known_server_state(pos, previous_state, player_pos);
         chunks.set_block_state(pos.x, pos.y, pos.z, state);
         mark_dirty(&pos, dirty_chunks);
     }
@@ -1207,6 +1215,36 @@ impl InteractionState {
             self.attack_strength_ticker = 0;
         }
     }
+}
+
+fn predict_default_replace(existing: BlockState, placing: BlockState) -> Option<bool> {
+    // Pomme only predicts the context-free BlockBehaviour rule. A replaceable
+    // state with properties may belong to a block whose canBeReplaced(context)
+    // override depends on held item, face, click location, or secondary-use
+    // state (snow layers are the canonical example). In that case the safe
+    // local prediction is no prediction at all.
+    if is_replaceable(existing) && block_properties(existing).entries().next().is_some() {
+        return None;
+    }
+    Some(is_replaceable(existing) && block_id(existing) != block_id(placing))
+}
+
+fn prediction_place_target(
+    hit: BlockHitResult,
+    placing: BlockState,
+    chunks: &ChunkStore,
+) -> Option<(BlockPos, BlockState)> {
+    // Vanilla BlockPlaceContext computes `replaceClicked` first. Only when the
+    // clicked state cannot be replaced does placement move to the relative
+    // block on the hit face.
+    let clicked = chunks.get_block_state(hit.block_pos.x, hit.block_pos.y, hit.block_pos.z);
+    if predict_default_replace(clicked, placing)? {
+        return Some((hit.block_pos, clicked));
+    }
+
+    let relative = hit.block_pos.offset_with_direction(hit.face);
+    let previous = chunks.get_block_state(relative.x, relative.y, relative.z);
+    predict_default_replace(previous, placing)?.then_some((relative, previous))
 }
 
 /// The player's attack speed with the given main-hand item: base 4.0 plus the
@@ -1680,10 +1718,69 @@ pub(crate) fn send_swap_offhand(sender: &PacketSender) {
 
 #[cfg(test)]
 mod tests {
+    use azalea_core::position::ChunkPos;
     use azalea_registry::HolderSet;
     use azalea_registry::identifier::Identifier;
+    use azalea_world::chunk::Chunk;
 
     use super::*;
+
+    fn loaded_test_store() -> ChunkStore {
+        crate::world::block::init("26.2");
+        let mut chunks = ChunkStore::new(2);
+        chunks.partial_storage.set(
+            &ChunkPos::new(0, 0),
+            Some(Chunk::default()),
+            &mut chunks.chunk_storage,
+        );
+        chunks
+    }
+
+    #[test]
+    fn placement_prediction_replaces_clicked_replaceable_block_before_adjacent_cell() {
+        let chunks = loaded_test_store();
+        let clicked_pos = BlockPos::new(8, 64, 8);
+        let grass = crate::world::block::find_state("short_grass", &[]);
+        let stone = crate::world::block::find_state("stone", &[]);
+        chunks.set_block_state(clicked_pos.x, clicked_pos.y, clicked_pos.z, grass);
+
+        let hit = BlockHitResult {
+            block_pos: clicked_pos,
+            face: Direction::East,
+            hit_point: dvec3(8.9, 64.2, 8.5),
+        };
+        let (target, previous) =
+            prediction_place_target(hit, stone, &chunks).expect("replaceable clicked block");
+        assert_eq!(target, clicked_pos);
+        assert_eq!(previous, grass);
+
+        chunks.set_block_state(clicked_pos.x, clicked_pos.y, clicked_pos.z, stone);
+        let (target, previous) =
+            prediction_place_target(hit, grass, &chunks).expect("adjacent air target");
+        assert_eq!(target, clicked_pos.offset_with_direction(Direction::East));
+        assert!(is_air(previous));
+    }
+
+    #[test]
+    fn placement_prediction_defers_contextual_replaceable_states_to_server() {
+        let chunks = loaded_test_store();
+        let clicked_pos = BlockPos::new(8, 64, 8);
+        let adjacent_pos = clicked_pos.offset_with_direction(Direction::East);
+        let snow = crate::world::block::find_state("snow", &[("layers", "1")]);
+        let stone = crate::world::block::find_state("stone", &[]);
+        let hit = BlockHitResult {
+            block_pos: clicked_pos,
+            face: Direction::East,
+            hit_point: dvec3(8.9, 64.2, 8.5),
+        };
+
+        chunks.set_block_state(clicked_pos.x, clicked_pos.y, clicked_pos.z, snow);
+        assert!(prediction_place_target(hit, stone, &chunks).is_none());
+
+        chunks.set_block_state(clicked_pos.x, clicked_pos.y, clicked_pos.z, stone);
+        chunks.set_block_state(adjacent_pos.x, adjacent_pos.y, adjacent_pos.z, snow);
+        assert!(prediction_place_target(hit, stone, &chunks).is_none());
+    }
 
     #[test]
     fn respawn_resets_player_owned_interaction_transients() {

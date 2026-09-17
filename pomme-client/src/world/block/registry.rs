@@ -75,8 +75,13 @@ pub struct BlockRegistry {
     flat_item_textures: std::collections::HashSet<String>,
     flat_item_texture_keys: HashMap<String, String>,
     item_ground_transforms: HashMap<String, glam::Mat4>,
-    /// Block name -> its single `BlockState`, for one-state blocks (see
-    /// `placeable_block_for_item`).
+    /// Block names that can correspond to held block items. Kept separate from
+    /// `placeable_blocks`: multi-state blocks are valid block-item uses even
+    /// when Pomme deliberately leaves their local placement state to the
+    /// server.
+    block_item_names: std::collections::HashSet<&'static str>,
+    /// Block name -> its single `BlockState`, for one-state blocks whose local
+    /// placement result is unambiguous without a full `BlockPlaceContext`.
     placeable_blocks: HashMap<&'static str, BlockState>,
 }
 
@@ -133,13 +138,23 @@ impl BlockRegistry {
             flat_item_textures,
             flat_item_texture_keys,
             item_ground_transforms,
+            block_item_names: build_block_item_names(),
             placeable_blocks: build_placeable_blocks(),
         }
     }
 
+    /// Whether a held item's registry name names a block. This is deliberately
+    /// broader than [`Self::placeable_block_for_item`]: multi-state block items
+    /// still consume the block-use interaction even when local state prediction
+    /// is disabled.
+    pub fn is_block_item(&self, item_name: &str) -> bool {
+        self.block_item_names.contains(item_name)
+    }
+
     /// Resolves a held item's registry name (unprefixed, e.g. `"stone"`) to the
-    /// `BlockState` to predict on placement, or `None` if the item is not a
-    /// single-state block. Item and block share a registry name for this set.
+    /// single `BlockState` Pomme can safely predict. Multi-state/contextual
+    /// blocks intentionally return `None` and stay server-authoritative
+    /// locally.
     pub fn placeable_block_for_item(&self, item_name: &str) -> Option<BlockState> {
         self.placeable_blocks.get(item_name).copied()
     }
@@ -259,8 +274,13 @@ impl BlockRegistry {
     }
 }
 
+fn build_block_item_names() -> std::collections::HashSet<&'static str> {
+    super::all_states().map(|(_, data)| data.id).collect()
+}
+
 /// Builds the block-name -> single-`BlockState` map from the block table,
-/// keeping only names that map to exactly one state.
+/// keeping only names that map to exactly one state. These are the only blocks
+/// whose local placement result Pomme predicts without contextual state logic.
 fn build_placeable_blocks() -> HashMap<&'static str, BlockState> {
     let mut seen: HashMap<&'static str, Option<BlockState>> = HashMap::new();
     for (state, data) in super::all_states() {
@@ -296,5 +316,31 @@ fn save_cache(path: &Path, textures: &HashMap<String, FaceTextures>) {
         && let Err(e) = std::fs::write(path, json)
     {
         tracing::warn!("Failed to write block cache: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contextual_multistate_block_items_are_not_locally_predicted() {
+        crate::world::block::init("26.2");
+        let block_items = build_block_item_names();
+        let predictable = build_placeable_blocks();
+
+        assert!(block_items.contains("stone"));
+        assert!(predictable.contains_key("stone"));
+
+        for name in ["oak_slab", "snow", "candle", "sea_pickle"] {
+            assert!(
+                block_items.contains(name),
+                "{name} is still a block-item use"
+            );
+            assert!(
+                !predictable.contains_key(name),
+                "{name} needs BlockPlaceContext-sensitive state selection and must stay server-authoritative locally"
+            );
+        }
     }
 }

@@ -2103,10 +2103,14 @@ impl AppCore {
         );
 
         let held_stack = game.player.inventory.held_stack(input.selected_slot());
-        let place_block = held_stack.and_then(|data| {
-            let name = crate::player::inventory::item_resource_name(data.kind);
-            renderer.registry().placeable_block_for_item(&name)
-        });
+        let held_item_name =
+            held_stack.map(|data| crate::player::inventory::item_resource_name(data.kind));
+        let held_block_item = held_item_name
+            .as_deref()
+            .is_some_and(|name| renderer.registry().is_block_item(name));
+        let place_block = held_item_name
+            .as_deref()
+            .and_then(|name| renderer.registry().placeable_block_for_item(name));
         let hands_empty = held_stack.is_none() && game.player.inventory.offhand().is_empty();
 
         let player_aabb = game.player.bounding_box();
@@ -2124,6 +2128,7 @@ impl AppCore {
             game.player.food,
             input.selected_slot(),
             held_stack,
+            held_block_item,
             place_block,
             hands_empty,
             &mut crate::player::interaction::BreakEffects {
