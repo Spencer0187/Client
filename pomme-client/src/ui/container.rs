@@ -11,8 +11,7 @@ use azalea_inventory::operations::{
 };
 
 use super::common::{
-    FONT_SIZE, SLOT_LABEL_COLOR, SLOT_SIZE, SLOT_STRIDE, WHITE, hit_test, push_gradient_overlay,
-    push_item_icon, push_slot,
+    FONT_SIZE, SLOT_LABEL_COLOR, SLOT_SIZE, SLOT_STRIDE, WHITE, hit_test, push_item_icon, push_slot,
 };
 use crate::player::menu_click::{self, ContainerKind};
 use crate::renderer::pipelines::menu_overlay::{MenuElement, SpriteId};
@@ -97,6 +96,20 @@ impl Panel {
     }
 }
 
+/// Vanilla's transparent in-game screen background
+/// (`Screen.extractTransparentBackground`).
+///
+/// Keep this as a dedicated element rather than a normal `GradientRect`:
+/// vanilla blends GUI colors in gamma space, while Pomme's sRGB target blends
+/// in linear space. The renderer compensates for that difference for this
+/// backdrop only.
+pub fn push_screen_backdrop(elements: &mut Vec<MenuElement>, screen_w: f32, screen_h: f32) {
+    elements.push(MenuElement::VanillaTransparentBackground {
+        w: screen_w,
+        h: screen_h,
+    });
+}
+
 /// The dimmed backdrop and the centered panel placement for a `panel_w` x
 /// `panel_h` (GUI units) container, without a background sprite.
 pub fn push_backdrop(
@@ -113,13 +126,7 @@ pub fn push_backdrop(
     let ox = (screen_w - w) / 2.0;
     let oy = (screen_h - h) / 2.0;
 
-    push_gradient_overlay(
-        elements,
-        screen_w,
-        screen_h,
-        [0.0627, 0.0627, 0.0627, 0.7529],
-        [0.0627, 0.0627, 0.0627, 0.8157],
-    );
+    push_screen_backdrop(elements, screen_w, screen_h);
 
     Panel {
         scale,

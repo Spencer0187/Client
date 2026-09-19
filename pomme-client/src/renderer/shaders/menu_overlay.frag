@@ -14,6 +14,7 @@ layout(set = 1, binding = 5) uniform sampler2D favicon_tex;
 layout(set = 1, binding = 6) uniform sampler2D overlay_tex;
 layout(set = 1, binding = 7) uniform sampler2D underwater_tex;
 layout(set = 1, binding = 8) uniform sampler2DArray mc_font_color_tex;
+layout(set = 1, binding = 9) uniform sampler2D scene_tex;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 1) in vec4 v_color;
@@ -28,7 +29,35 @@ float sdf_rounded_rect(vec2 p, vec2 half_size, float radius) {
     return min(max(q.x, q.y), 0.0) + length(max(q, vec2(0.0))) - radius;
 }
 
+vec3 linear_to_srgb(vec3 c) {
+    bvec3 low = lessThanEqual(c, vec3(0.0031308));
+    vec3 lo = c * 12.92;
+    vec3 hi = 1.055 * pow(max(c, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    return mix(hi, lo, low);
+}
+
+vec3 srgb_to_linear(vec3 c) {
+    bvec3 low = lessThanEqual(c, vec3(0.04045));
+    vec3 lo = c / 12.92;
+    vec3 hi = pow((c + 0.055) / 1.055, vec3(2.4));
+    return mix(hi, lo, low);
+}
+
 void main() {
+    if (v_mode > 10.5) {
+        // Vanilla draws both the world and GUI into RGBA8_UNORM and blends the
+        // GUI directly on those stored code values. Pomme draws into an sRGB
+        // attachment, whose fixed-function blend first decodes the destination
+        // to linear light. Recover the copied swapchain's stored code values,
+        // reproduce vanilla's UNORM blend, then convert back to linear so the
+        // sRGB attachment stores exactly that result. Alpha 1 replaces the
+        // current destination through Pomme's premultiplied blend state.
+        vec3 scene_code = linear_to_srgb(texture(scene_tex, v_uv).rgb);
+        vec3 vanilla_code = mix(scene_code, v_color.rgb, v_color.a);
+        out_color = vec4(srgb_to_linear(vanilla_code), 1.0);
+        return;
+    }
+
     if (v_mode > 9.5) {
         // Plain premultiplied fill; color pre-converted CPU-side (sleep fade).
         out_color = v_color;

@@ -275,7 +275,7 @@ impl MenuOverlayPipeline {
         );
 
         // One combined image sampler per menu_overlay.frag binding.
-        let tex_bindings: [vk::DescriptorSetLayoutBinding; 9] =
+        let tex_bindings: [vk::DescriptorSetLayoutBinding; 10] =
             std::array::from_fn(|binding| vk::DescriptorSetLayoutBinding {
                 binding: binding as u32,
                 descriptor_type: vk::DescriptorType::CombinedImageSampler,
@@ -549,6 +549,7 @@ impl MenuOverlayPipeline {
             &overlay_img_info,
             &underwater_img_info,
             &mc_font_color_img_info,
+            &font_img_info, // scene-copy placeholder until `set_scene_texture`
         ];
         let writes: Vec<_> = tex_image_infos
             .iter()
@@ -1018,7 +1019,11 @@ impl MenuOverlayPipeline {
                         *corner_radius,
                         *color_top,
                         *color_bottom,
+                        0.0,
                     );
+                }
+                MenuElement::VanillaTransparentBackground { w, h } => {
+                    push_vanilla_transparent_background(&mut vertices, *w, *h);
                 }
                 MenuElement::FrostedRect {
                     x,
@@ -1432,6 +1437,28 @@ impl MenuOverlayPipeline {
         device.update_descriptor_sets(&[write], &[]);
     }
 
+    pub fn set_scene_texture(
+        &self,
+        device: &vk::Device,
+        view: vk::ImageView,
+        sampler: vk::Sampler,
+    ) {
+        let info = vk::DescriptorImageInfo {
+            sampler,
+            image_view: view,
+            image_layout: vk::ImageLayout::ShaderReadOnlyOptimal,
+        };
+        let write = vk::WriteDescriptorSet {
+            dst_set: self.tex_set,
+            dst_binding: 9,
+            descriptor_count: 1,
+            descriptor_type: vk::DescriptorType::CombinedImageSampler,
+            image_info: &info,
+            ..Default::default()
+        };
+        device.update_descriptor_sets(&[write], &[]);
+    }
+
     pub fn set_blur_texture(&self, device: &vk::Device, view: vk::ImageView, sampler: vk::Sampler) {
         let info = vk::DescriptorImageInfo {
             sampler,
@@ -1829,6 +1856,12 @@ pub enum MenuElement {
         corner_radius: f32,
         color_top: [f32; 4],
         color_bottom: [f32; 4],
+    },
+    /// Vanilla `Screen.extractTransparentBackground`: a full-screen
+    /// `0xC0101010` -> `0xD0101010` gradient with gamma-space GUI blending.
+    VanillaTransparentBackground {
+        w: f32,
+        h: f32,
     },
     Tooltip {
         x: f32,
@@ -3838,6 +3871,21 @@ fn push_rect(
     );
 }
 
+fn push_vanilla_transparent_background(verts: &mut Vec<Vertex>, w: f32, h: f32) {
+    let channel = 16.0 / 255.0;
+    push_gradient_rect(
+        verts,
+        0.0,
+        0.0,
+        w,
+        h,
+        0.0,
+        [channel, channel, channel, 192.0 / 255.0],
+        [channel, channel, channel, 208.0 / 255.0],
+        11.0,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn push_gradient_rect(
     verts: &mut Vec<Vertex>,
@@ -3848,6 +3896,7 @@ fn push_gradient_rect(
     radius: f32,
     color_top: [f32; 4],
     color_bottom: [f32; 4],
+    mode: f32,
 ) {
     let positions = [
         [x, y],
@@ -3878,7 +3927,7 @@ fn push_gradient_rect(
             pos: positions[i],
             uv: uvs[i],
             color: colors[i],
-            mode: 0.0,
+            mode,
             rect_size: [w, h],
             corner_radius: radius,
         });
@@ -4572,6 +4621,22 @@ fn create_pipeline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vanilla_transparent_background_matches_reference_gradient() {
+        let mut verts = Vec::new();
+        push_vanilla_transparent_background(&mut verts, 320.0, 180.0);
+
+        let channel = 16.0 / 255.0;
+        let top = [channel, channel, channel, 192.0 / 255.0];
+        let bottom = [channel, channel, channel, 208.0 / 255.0];
+        assert_eq!(verts.len(), 6);
+        assert_eq!(verts[0].color, top);
+        assert_eq!(verts[1].color, top);
+        assert_eq!(verts[2].color, bottom);
+        assert_eq!(verts[4].color, bottom);
+        assert!(verts.iter().all(|vertex| vertex.mode == 11.0));
+    }
 
     #[test]
     fn abutting_effects_merge_into_one_quad() {

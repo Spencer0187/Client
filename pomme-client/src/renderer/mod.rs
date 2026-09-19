@@ -5,6 +5,7 @@ mod context;
 pub mod entity_model;
 pub(crate) mod packing;
 pub mod pipelines;
+mod scene_copy;
 mod screenshot;
 pub(crate) mod shader;
 mod swapchain;
@@ -42,6 +43,7 @@ pub use pipelines::sky::{SkyPipeline, SkyState};
 pub use pipelines::weather::{WeatherColumn, WeatherPipeline};
 use pyronyx::khr::swapchain::{SwapchainDevice, SwapchainQueue};
 use pyronyx::vk;
+use scene_copy::SceneCopy;
 use swapchain::Swapchain;
 use thiserror::Error;
 use winit::dpi::PhysicalSize;
@@ -157,6 +159,7 @@ pub struct Renderer {
     panorama_pipeline: PanoramaPipeline,
     menu_pipeline: MenuOverlayPipeline,
     blur_pipeline: BlurPipeline,
+    scene_copy: SceneCopy,
     skin_preview: SkinPreviewPipeline,
     book_preview: BookPreviewPipeline,
     chunk_border_pipeline: ChunkBorderPipeline,
@@ -380,6 +383,16 @@ impl Renderer {
             blur_pipeline.blurred_view(),
             blur_pipeline.blurred_sampler(),
         );
+        let scene_copy = SceneCopy::new(
+            &ctx.device,
+            ctx.graphics_queue,
+            ctx.command_pool,
+            &ctx.allocator,
+            swapchain_extent.width,
+            swapchain_extent.height,
+            swapchain_state.format.format,
+        );
+        menu_pipeline.set_scene_texture(&ctx.device, scene_copy.view(), scene_copy.sampler());
 
         let sem_info = vk::SemaphoreCreateInfo::default();
         let mut render_finished_per_image = Vec::with_capacity(swapchain_state.images.len());
@@ -480,6 +493,7 @@ impl Renderer {
             panorama_pipeline,
             menu_pipeline,
             blur_pipeline,
+            scene_copy,
             skin_preview,
             book_preview,
             entity_renderer,
@@ -752,6 +766,20 @@ impl Renderer {
             &self.ctx.device,
             self.blur_pipeline.blurred_view(),
             self.blur_pipeline.blurred_sampler(),
+        );
+        self.scene_copy.resize(
+            &self.ctx.device,
+            self.ctx.graphics_queue,
+            self.ctx.command_pool,
+            &self.ctx.allocator,
+            self.width,
+            self.height,
+            self.swapchain.format.format,
+        );
+        self.menu_pipeline.set_scene_texture(
+            &self.ctx.device,
+            self.scene_copy.view(),
+            self.scene_copy.sampler(),
         );
 
         let sem_info = vk::SemaphoreCreateInfo::default();
@@ -1611,8 +1639,15 @@ impl Renderer {
         }
 
         let use_blur = matches!(&mode, RenderMode::MainMenu { blur, .. } if *blur > 0.01);
+        let split_container_backdrop = matches!(
+            &mode,
+            RenderMode::World { overlay, .. }
+                if overlay.iter().any(|element| {
+                    matches!(element, MenuElement::VanillaTransparentBackground { .. })
+                })
+        );
 
-        let (rp, fb) = if use_blur {
+        let (rp, fb) = if use_blur || split_container_backdrop {
             (
                 self.swapchain.render_pass_scene,
                 self.swapchain.framebuffers_scene[image_index as usize],
@@ -1809,8 +1844,48 @@ impl Renderer {
                     }
                 }
 
-                self.menu_pipeline
-                    .draw(cmd, sw, sh, overlay, &item_atlas_uvs);
+                if let Some(backdrop_index) = overlay.iter().position(|element| {
+                    matches!(element, MenuElement::VanillaTransparentBackground { .. })
+                }) {
+                    let vertex_base = self.menu_pipeline.draw_from(
+                        cmd,
+                        sw,
+                        sh,
+                        &overlay[..backdrop_index],
+                        &item_atlas_uvs,
+                        0,
+                    );
+                    cmd.end_render_pass();
+
+                    let swapchain_image = self.swapchain.images[image_index as usize];
+                    self.scene_copy.capture(cmd, swapchain_image);
+
+                    let load_rp_info = vk::RenderPassBeginInfo {
+                        render_pass: self.swapchain.render_pass_load,
+                        framebuffer: self.swapchain.framebuffers_load[image_index as usize],
+                        render_area: vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.swapchain.extent,
+                        },
+                        clear_value_count: clear_values.len() as u32,
+                        clear_values: clear_values.as_ptr(),
+                        ..Default::default()
+                    };
+                    cmd.begin_render_pass(&load_rp_info, vk::SubpassContents::Inline);
+                    cmd.set_viewport(0, &[viewport]);
+                    cmd.set_scissor(0, &[scissor]);
+                    self.menu_pipeline.draw_from(
+                        cmd,
+                        sw,
+                        sh,
+                        &overlay[backdrop_index..],
+                        &item_atlas_uvs,
+                        vertex_base,
+                    );
+                } else {
+                    self.menu_pipeline
+                        .draw(cmd, sw, sh, overlay, &item_atlas_uvs);
+                }
 
                 // Each preview box gets its depth cleared and its own scissor
                 // while the 3D content draws.
@@ -2263,6 +2338,8 @@ impl Drop for Renderer {
         self.panorama_pipeline
             .destroy(&self.ctx.device, &self.ctx.allocator);
         self.menu_pipeline
+            .destroy(&self.ctx.device, &self.ctx.allocator);
+        self.scene_copy
             .destroy(&self.ctx.device, &self.ctx.allocator);
         self.blur_pipeline
             .destroy(&self.ctx.device, &self.ctx.allocator);
