@@ -15,6 +15,7 @@ pub struct Swapchain {
     pub handle: vk::SwapchainKHR,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+    pub unorm_views: Vec<vk::ImageView>,
     pub format: vk::SurfaceFormatKHR,
     pub extent: vk::Extent2D,
     pub present_mode: vk::PresentModeKHR,
@@ -24,9 +25,11 @@ pub struct Swapchain {
     pub render_pass: vk::RenderPass,
     pub render_pass_scene: vk::RenderPass,
     pub render_pass_load: vk::RenderPass,
+    pub render_pass_unorm: Option<vk::RenderPass>,
     pub framebuffers: Vec<vk::Framebuffer>,
     pub framebuffers_scene: Vec<vk::Framebuffer>,
     pub framebuffers_load: Vec<vk::Framebuffer>,
+    pub framebuffers_unorm: Vec<vk::Framebuffer>,
 }
 
 impl Swapchain {
@@ -121,7 +124,48 @@ impl Swapchain {
             ..Default::default()
         };
 
-        let swapchain = ctx.device.create_swapchain(&swapchain_info, None)?;
+        // UNORM aliases blend against the stored sRGB code values like vanilla.
+        let unorm_format = match format.format {
+            vk::Format::B8G8R8A8Srgb => Some(vk::Format::B8G8R8A8Unorm),
+            vk::Format::R8G8B8A8Srgb => Some(vk::Format::R8G8B8A8Unorm),
+            _ => None,
+        };
+        let supported_unorm = unorm_format.filter(|&fmt| {
+            ctx.physical_device
+                .get_format_properties(fmt)
+                .optimal_tiling_features
+                .contains(vk::FormatFeatureFlags::ColorAttachmentBlend)
+        });
+        // Debug-only A/B switch for profiling the fallback on the same GPU.
+        let force_fallback =
+            cfg!(debug_assertions) && std::env::var_os("POMME_FORCE_SRGB_BACKDROP").is_some();
+        let mutable = ctx.mutable_swapchain_format && supported_unorm.is_some() && !force_fallback;
+        let view_formats = [format.format, supported_unorm.unwrap_or(format.format)];
+        let mut format_list = vk::ImageFormatListCreateInfo {
+            view_format_count: view_formats.len() as u32,
+            view_formats: view_formats.as_ptr(),
+            ..Default::default()
+        };
+        let mut exact_format = if mutable { supported_unorm } else { None };
+        let swapchain = if mutable {
+            let mutable_info = vk::SwapchainCreateInfoKHR {
+                flags: vk::SwapchainCreateFlagsKHR::MutableFormat,
+                ..swapchain_info
+            }
+            .next(&mut format_list);
+            match ctx.device.create_swapchain(&mutable_info, None) {
+                Ok(sc) => sc,
+                Err(error) => {
+                    tracing::warn!(
+                        "Mutable-format swapchain unavailable ({error}); using fitted background"
+                    );
+                    exact_format = None;
+                    ctx.device.create_swapchain(&swapchain_info, None)?
+                }
+            }
+        } else {
+            ctx.device.create_swapchain(&swapchain_info, None)?
+        };
         let images = ctx.device.get_swapchain_images(swapchain)?;
 
         let image_views = images
@@ -138,12 +182,42 @@ impl Swapchain {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        tracing::info!(
+            "Container backdrop: {}",
+            if exact_format.is_some() {
+                "native UNORM"
+            } else {
+                "fitted sRGB"
+            }
+        );
+        let unorm_views = if let Some(unorm_format) = exact_format {
+            images
+                .iter()
+                .map(|&image| {
+                    ctx.device.create_image_view(
+                        &vk::ImageViewCreateInfo {
+                            image,
+                            view_type: vk::ImageViewType::Type2D,
+                            format: unorm_format,
+                            subresource_range: util::COLOR_SUBRESOURCE_RANGE,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
         let (depth_image, depth_view, depth_allocation) =
             create_depth_resources(&ctx.device, extent, &ctx.allocator)?;
 
         let render_pass = create_render_pass(&ctx.device, format.format)?;
         let render_pass_scene = create_render_pass_scene(&ctx.device, format.format)?;
         let render_pass_load = create_render_pass_load(&ctx.device, format.format)?;
+        let render_pass_unorm = exact_format
+            .map(|format| create_render_pass_unorm(&ctx.device, format))
+            .transpose()?;
 
         let make_fbs = |rp: vk::RenderPass| -> Result<Vec<vk::Framebuffer>, vk::Error> {
             image_views
@@ -167,11 +241,34 @@ impl Swapchain {
         let framebuffers = make_fbs(render_pass)?;
         let framebuffers_scene = make_fbs(render_pass_scene)?;
         let framebuffers_load = make_fbs(render_pass_load)?;
+        let framebuffers_unorm = if let Some(pass) = render_pass_unorm {
+            unorm_views
+                .iter()
+                .map(|&view| {
+                    let attachments = [view, depth_view];
+                    ctx.device.create_framebuffer(
+                        &vk::FramebufferCreateInfo {
+                            render_pass: pass,
+                            attachment_count: attachments.len() as u32,
+                            attachments: attachments.as_ptr(),
+                            width: extent.width,
+                            height: extent.height,
+                            layers: 1,
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            Vec::new()
+        };
 
         Ok(Self {
             handle: swapchain,
             images,
             image_views,
+            unorm_views,
             format,
             extent,
             present_mode,
@@ -181,9 +278,11 @@ impl Swapchain {
             render_pass,
             render_pass_scene,
             render_pass_load,
+            render_pass_unorm,
             framebuffers,
             framebuffers_scene,
             framebuffers_load,
+            framebuffers_unorm,
         })
     }
 
@@ -194,6 +293,7 @@ impl Swapchain {
             &mut self.framebuffers,
             &mut self.framebuffers_scene,
             &mut self.framebuffers_load,
+            &mut self.framebuffers_unorm,
         ] {
             for &fb in fbs.iter() {
                 device.destroy_framebuffer(fb, None);
@@ -209,6 +309,9 @@ impl Swapchain {
             device.destroy_render_pass(rp, None);
         }
 
+        if let Some(pass) = self.render_pass_unorm.take() {
+            device.destroy_render_pass(pass, None);
+        }
         device.destroy_image_view(self.depth_view, None);
         if let Some(alloc) = self.depth_allocation.take() {
             allocator.lock().unwrap().free(alloc).ok();
@@ -219,6 +322,10 @@ impl Swapchain {
             device.destroy_image_view(view, None);
         }
         self.image_views.clear();
+        for &view in &self.unorm_views {
+            device.destroy_image_view(view, None);
+        }
+        self.unorm_views.clear();
 
         device.destroy_swapchain(self.handle, None);
     }
@@ -357,6 +464,19 @@ fn create_render_pass_scene(
         color_format,
         vk::AttachmentLoadOp::Clear,
         vk::ImageLayout::Undefined,
+        vk::ImageLayout::ColorAttachmentOptimal,
+    )
+}
+
+fn create_render_pass_unorm(
+    device: &vk::Device,
+    color_format: vk::Format,
+) -> Result<vk::RenderPass, vk::Error> {
+    create_render_pass_variant(
+        device,
+        color_format,
+        vk::AttachmentLoadOp::Load,
+        vk::ImageLayout::ColorAttachmentOptimal,
         vk::ImageLayout::ColorAttachmentOptimal,
     )
 }

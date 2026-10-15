@@ -138,6 +138,29 @@ enum RenderMode<'a> {
     },
 }
 
+fn sync_swapchain_color(cmd: vk::CommandBuffer, image: vk::Image) {
+    let barrier = vk::ImageMemoryBarrier {
+        src_access_mask: vk::AccessFlags::ColorAttachmentWrite,
+        dst_access_mask: vk::AccessFlags::ColorAttachmentRead
+            | vk::AccessFlags::ColorAttachmentWrite,
+        old_layout: vk::ImageLayout::ColorAttachmentOptimal,
+        new_layout: vk::ImageLayout::ColorAttachmentOptimal,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        image,
+        subresource_range: util::COLOR_SUBRESOURCE_RANGE,
+        ..Default::default()
+    };
+    cmd.pipeline_barrier(
+        vk::PipelineStageFlags::ColorAttachmentOutput,
+        vk::PipelineStageFlags::ColorAttachmentOutput,
+        vk::DependencyFlags::empty(),
+        &[],
+        &[],
+        &[barrier],
+    );
+}
+
 #[derive(Default, Clone)]
 pub struct RenderTimings {
     pub pace_ms: f32,
@@ -242,6 +265,7 @@ impl Renderer {
             ctx.graphics_queue,
             ctx.command_pool,
             swapchain_state.render_pass,
+            swapchain_state.render_pass_unorm,
             &ctx.allocator,
             font_sources,
             font_layer_limit,
@@ -772,8 +796,11 @@ impl Renderer {
             .recreate_pipeline(&self.ctx.device, self.swapchain.render_pass);
         self.panorama_pipeline
             .recreate_pipeline(&self.ctx.device, self.swapchain.render_pass);
-        self.menu_pipeline
-            .recreate_pipeline(&self.ctx.device, self.swapchain.render_pass);
+        self.menu_pipeline.recreate_pipeline(
+            &self.ctx.device,
+            self.swapchain.render_pass,
+            self.swapchain.render_pass_unorm,
+        );
         self.skin_preview
             .recreate_pipeline(&self.ctx.device, self.swapchain.render_pass);
         self.book_preview
@@ -1780,8 +1807,18 @@ impl Renderer {
         }
 
         let use_blur = matches!(&mode, RenderMode::MainMenu { blur, .. } if *blur > 0.01);
+        let unorm_backdrop_index = if self.swapchain.render_pass_unorm.is_some() {
+            match &mode {
+                RenderMode::World { overlay, .. } => overlay
+                    .iter()
+                    .position(|e| matches!(e, MenuElement::VanillaTransparentBackground { .. })),
+                _ => None,
+            }
+        } else {
+            None
+        };
 
-        let (rp, fb) = if use_blur {
+        let (rp, fb) = if use_blur || unorm_backdrop_index.is_some() {
             (
                 self.swapchain.render_pass_scene,
                 self.swapchain.framebuffers_scene[image_index as usize],
@@ -1989,8 +2026,71 @@ impl Renderer {
                     }
                 }
 
-                self.menu_pipeline
-                    .draw(cmd, sw, sh, overlay, &item_atlas_uvs);
+                if let (Some(render_pass), Some(index)) =
+                    (self.swapchain.render_pass_unorm, unorm_backdrop_index)
+                {
+                    let mut vertex_base = self.menu_pipeline.draw_from(
+                        cmd,
+                        sw,
+                        sh,
+                        &overlay[..index],
+                        &item_atlas_uvs,
+                        0,
+                    );
+                    cmd.end_render_pass();
+                    sync_swapchain_color(cmd, self.swapchain.images[image_index as usize]);
+
+                    let begin = vk::RenderPassBeginInfo {
+                        render_pass,
+                        framebuffer: self.swapchain.framebuffers_unorm[image_index as usize],
+                        render_area: vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.swapchain.extent,
+                        },
+                        clear_value_count: clear_values.len() as u32,
+                        clear_values: clear_values.as_ptr(),
+                        ..Default::default()
+                    };
+                    cmd.begin_render_pass(&begin, vk::SubpassContents::Inline);
+                    cmd.set_viewport(0, &[viewport]);
+                    cmd.set_scissor(0, &[scissor]);
+                    vertex_base = self.menu_pipeline.draw_unorm_background(
+                        cmd,
+                        sw,
+                        sh,
+                        &overlay[index],
+                        &item_atlas_uvs,
+                        vertex_base,
+                    );
+                    cmd.end_render_pass();
+                    sync_swapchain_color(cmd, self.swapchain.images[image_index as usize]);
+
+                    let load = vk::RenderPassBeginInfo {
+                        render_pass: self.swapchain.render_pass_load,
+                        framebuffer: self.swapchain.framebuffers_load[image_index as usize],
+                        render_area: vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: self.swapchain.extent,
+                        },
+                        clear_value_count: clear_values.len() as u32,
+                        clear_values: clear_values.as_ptr(),
+                        ..Default::default()
+                    };
+                    cmd.begin_render_pass(&load, vk::SubpassContents::Inline);
+                    cmd.set_viewport(0, &[viewport]);
+                    cmd.set_scissor(0, &[scissor]);
+                    self.menu_pipeline.draw_from(
+                        cmd,
+                        sw,
+                        sh,
+                        &overlay[index + 1..],
+                        &item_atlas_uvs,
+                        vertex_base,
+                    );
+                } else {
+                    self.menu_pipeline
+                        .draw(cmd, sw, sh, overlay, &item_atlas_uvs);
+                }
 
                 // Each preview box gets its depth cleared and its own scissor
                 // while the 3D content draws.

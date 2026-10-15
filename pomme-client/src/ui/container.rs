@@ -11,8 +11,7 @@ use azalea_inventory::operations::{
 };
 
 use super::common::{
-    FONT_SIZE, SLOT_LABEL_COLOR, SLOT_SIZE, SLOT_STRIDE, WHITE, hit_test, push_gradient_overlay,
-    push_item_icon,
+    FONT_SIZE, SLOT_LABEL_COLOR, SLOT_SIZE, SLOT_STRIDE, WHITE, hit_test, push_item_icon,
 };
 use crate::player::menu_click::{self, ContainerKind};
 use crate::renderer::pipelines::menu_overlay::{MenuElement, SpriteId};
@@ -115,13 +114,7 @@ pub fn push_backdrop(
     let ox = (screen_w - w) / 2.0;
     let oy = (screen_h - h) / 2.0;
 
-    push_gradient_overlay(
-        elements,
-        screen_w,
-        screen_h,
-        [0.0, 0.0, 0.0, 0.45],
-        [0.0, 0.0, 0.0, 0.50],
-    );
+    push_screen_backdrop(elements, screen_w, screen_h);
 
     Panel {
         scale,
@@ -130,6 +123,14 @@ pub fn push_backdrop(
         w,
         h,
     }
+}
+
+/// Vanilla transparent in-world background, composited in UNORM or sRGB.
+pub fn push_screen_backdrop(elements: &mut Vec<MenuElement>, screen_w: f32, screen_h: f32) {
+    elements.push(MenuElement::VanillaTransparentBackground {
+        w: screen_w,
+        h: screen_h,
+    });
 }
 
 /// The dimmed backdrop and the centered 176 x `panel_h` container background

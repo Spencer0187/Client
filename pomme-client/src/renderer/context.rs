@@ -48,6 +48,7 @@ const DEVICE_EXTENSIONS: &[&CStr] = &[
 
 /// Optional, enabled only when the device supports both.
 const PRESENT_WAIT_EXTENSIONS: &[&CStr] = &[khr::present_id::NAME, khr::present_wait::NAME];
+const MUTABLE_SWAPCHAIN_FORMAT_EXTENSION: &CStr = c"VK_KHR_swapchain_mutable_format";
 
 pub struct VulkanContext {
     pub instance: vk::Instance,
@@ -69,6 +70,7 @@ pub struct VulkanContext {
     pub in_flight_fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
     pub frame_index: usize,
     pub present_wait: bool,
+    pub mutable_swapchain_format: bool,
 
     #[cfg(debug_assertions)]
     debug_messenger: vk::DebugUtilsMessengerEXT,
@@ -215,9 +217,18 @@ impl VulkanContext {
         } else {
             &[]
         };
+        let mutable_swapchain_format =
+            supports_extensions(&physical_device, &[MUTABLE_SWAPCHAIN_FORMAT_EXTENSION]);
+        tracing::info!("VK_KHR_swapchain_mutable_format: {mutable_swapchain_format}");
+        let mutable_extensions: &[&CStr] = if mutable_swapchain_format {
+            &[MUTABLE_SWAPCHAIN_FORMAT_EXTENSION]
+        } else {
+            &[]
+        };
         let device_extension_names: Vec<*const c_char> = DEVICE_EXTENSIONS
             .iter()
             .chain(optional_extensions)
+            .chain(mutable_extensions)
             .map(|ext| ext.as_ptr())
             .collect();
 
@@ -305,6 +316,7 @@ impl VulkanContext {
             in_flight_fences,
             frame_index: 0,
             present_wait,
+            mutable_swapchain_format,
             #[cfg(debug_assertions)]
             debug_messenger,
             gpu_name,

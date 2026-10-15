@@ -13,6 +13,7 @@ use azalea_registry::builtin::{DataComponentKind, ItemKind};
 use super::common::{
     self, FONT_SIZE, SLOT_LABEL_COLOR, SLOT_SIZE, SLOT_STRIDE, WHITE, hit_test, push_slot, rgb,
 };
+use super::container;
 use super::creative_tab_data::{
     BUILDING_BLOCKS_ITEMS, COLORED_BLOCKS_ITEMS, COMBAT_ITEMS, FOOD_AND_DRINKS_ITEMS,
     FUNCTIONAL_BLOCKS_ITEMS, INGREDIENTS_ITEMS, NATURAL_BLOCKS_ITEMS, OP_BLOCKS_ITEMS,
@@ -413,13 +414,7 @@ pub fn build_creative_inventory(
     let inv_w = TEX_W * scale;
     let inv_h = TEX_H * scale;
 
-    common::push_gradient_overlay(
-        elements,
-        screen_w,
-        screen_h,
-        [0.0, 0.0, 0.0, 0.45],
-        [0.0, 0.0, 0.0, 0.50],
-    );
+    container::push_screen_backdrop(elements, screen_w, screen_h);
 
     draw_tabs(elements, state, ox, oy, scale, false);
 
